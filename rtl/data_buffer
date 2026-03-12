@@ -1,0 +1,193 @@
+//==================================================================
+// Data Buffer (Asynchronous FIFO)
+// 跨时钟域数据缓冲，用于写操作
+// 特性：
+//   1. 异步FIFO，深度4
+//   2. 格雷码指针同步
+//   3. 空满标志生成
+//==================================================================
+
+module data_buffer (
+    // 时钟域
+    input  wire         wr_clk,    // 写时钟（APB）
+    input  wire         rd_clk,    // 读时钟（AHB）
+    input  wire         wr_rstn,   // 写复位
+    input  wire         rd_rstn,   // 读复位
+    
+    // 写接口
+    input  wire         wr_en,     // 写使能
+    input  wire [63:0]  wr_data,   // 写数据 {地址[31:0], 数据[31:0]}
+    output wire         wr_full,   // FIFO满标志
+    
+    // 读接口
+    input  wire         rd_en,     // 读使能
+    output wire [63:0]  rd_data,   // 读数据
+    output wire         rd_empty,  // FIFO空标志
+    
+    // 状态
+    output wire [2:0]  data_count,  // 数据计数
+    output wire [2:0]  free_count   // 剩余空间
+);
+
+//==================================================================
+// 参数定义
+//==================================================================
+parameter DEPTH     = 4;      // FIFO深度
+parameter ADDR_WIDTH = 2;     // 地址宽度 = log2(DEPTH)
+parameter DATA_WIDTH = 64;    // 数据宽度
+
+//==================================================================
+// 存储器和指针
+//==================================================================
+reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];  // 双端口RAM
+
+reg  [ADDR_WIDTH:0] wr_ptr;  // 写指针（多1位用于判断满）
+reg  [ADDR_WIDTH:0] rd_ptr;  // 读指针（多1位用于判断满）
+
+wire [ADDR_WIDTH:0] wr_ptr_gray;  // 写指针格雷码
+wire [ADDR_WIDTH:0] rd_ptr_gray;  // 读指针格雷码
+
+reg  [ADDR_WIDTH:0] wr_ptr_gray_sync1, wr_ptr_gray_sync2;  // 同步到读时钟域
+reg  [ADDR_WIDTH:0] rd_ptr_gray_sync1, rd_ptr_gray_sync2;  // 同步到写时钟域
+
+//==================================================================
+// 二进制转格雷码
+//==================================================================
+function [ADDR_WIDTH:0] bin2gray;
+    input [ADDR_WIDTH:0] bin;
+    begin
+        bin2gray = bin ^ (bin >> 1);
+    end
+endfunction
+
+//==================================================================
+// 格雷码转二进制
+//==================================================================
+function [ADDR_WIDTH:0] gray2bin;
+    input [ADDR_WIDTH:0] gray;
+    integer i;
+    reg [ADDR_WIDTH:0] bin;
+    begin
+        bin[ADDR_WIDTH] = gray[ADDR_WIDTH];
+        for (i = ADDR_WIDTH-1; i >= 0; i = i-1) begin
+            bin[i] = bin[i+1] ^ gray[i];
+        end
+        gray2bin = bin;
+    end
+endfunction
+
+//==================================================================
+// 写时钟域逻辑
+//==================================================================
+wire [ADDR_WIDTH:0] rd_ptr_bin;  // 同步后的读指针（二进制）
+wire [ADDR_WIDTH:0] wr_addr;     // 写地址
+wire                fifo_full;   // FIFO满
+
+// 读指针同步到写时钟域
+always @(posedge wr_clk or negedge wr_rstn) begin
+    if (!wr_rstn) begin
+        rd_ptr_gray_sync1 <= {(ADDR_WIDTH+1){1'b0}};
+        rd_ptr_gray_sync2 <= {(ADDR_WIDTH+1){1'b0}};
+    end else begin
+        rd_ptr_gray_sync1 <= rd_ptr_gray;
+        rd_ptr_gray_sync2 <= rd_ptr_gray_sync1;
+    end
+end
+
+// 格雷码转二进制
+assign rd_ptr_bin = gray2bin(rd_ptr_gray_sync2);
+
+// 写地址（指针低ADDR_WIDTH位）
+assign wr_addr = wr_ptr[ADDR_WIDTH-1:0];
+
+// 满标志：写指针比读指针多一圈
+assign fifo_full = (wr_ptr[ADDR_WIDTH] != rd_ptr_bin[ADDR_WIDTH]) &&
+                   (wr_ptr[ADDR_WIDTH-1:0] == rd_ptr_bin[ADDR_WIDTH-1:0]);
+
+assign wr_full = fifo_full;
+
+// 写指针和存储器更新
+always @(posedge wr_clk or negedge wr_rstn) begin
+    if (!wr_rstn) begin
+        wr_ptr <= {(ADDR_WIDTH+1){1'b0}};
+    end else if (wr_en && !fifo_full) begin
+        mem[wr_addr] <= wr_data;
+        wr_ptr <= wr_ptr + 1'b1;
+    end
+end
+
+// 写指针格雷码
+assign wr_ptr_gray = bin2gray(wr_ptr);
+
+//==================================================================
+// 读时钟域逻辑
+//==================================================================
+wire [ADDR_WIDTH:0] wr_ptr_bin;  // 同步后的写指针（二进制）
+wire [ADDR_WIDTH:0] rd_addr;     // 读地址
+wire                fifo_empty;  // FIFO空
+
+// 写指针同步到读时钟域
+always @(posedge rd_clk or negedge rd_rstn) begin
+    if (!rd_rstn) begin
+        wr_ptr_gray_sync1 <= {(ADDR_WIDTH+1){1'b0}};
+        wr_ptr_gray_sync2 <= {(ADDR_WIDTH+1){1'b0}};
+    end else begin
+        wr_ptr_gray_sync1 <= wr_ptr_gray;
+        wr_ptr_gray_sync2 <= wr_ptr_gray_sync1;
+    end
+end
+
+// 格雷码转二进制
+assign wr_ptr_bin = gray2bin(wr_ptr_gray_sync2);
+
+// 读地址
+assign rd_addr = rd_ptr[ADDR_WIDTH-1:0];
+
+// 空标志：读写指针相等
+assign fifo_empty = (rd_ptr == wr_ptr_bin);
+
+assign rd_empty = fifo_empty;
+
+// 读指针和输出数据更新
+always @(posedge rd_clk or negedge rd_rstn) begin
+    if (!rd_rstn) begin
+        rd_ptr <= {(ADDR_WIDTH+1){1'b0}};
+    end else if (rd_en && !fifo_empty) begin
+        rd_ptr <= rd_ptr + 1'b1;
+    end
+end
+
+// 输出数据
+assign rd_data = mem[rd_addr];
+
+// 读指针格雷码
+assign rd_ptr_gray = bin2gray(rd_ptr);
+
+//==================================================================
+// FIFO状态计数
+//==================================================================
+
+// 写时钟域计数
+reg [ADDR_WIDTH:0] wr_data_count;
+always @(posedge wr_clk or negedge wr_rstn) begin
+    if (!wr_rstn) begin
+        wr_data_count <= {(ADDR_WIDTH+1){1'b0}};
+    end else begin
+        wr_data_count <= wr_ptr - rd_ptr_bin;
+    end
+end
+
+// 读时钟域计数
+reg [ADDR_WIDTH:0] rd_data_count;
+always @(posedge rd_clk or negedge rd_rstn) begin
+    if (!rd_rstn) begin
+        rd_data_count <= {(ADDR_WIDTH+1){1'b0}};
+    end else begin
+        rd_data_count <= wr_ptr_bin - rd_ptr;
+    end
+end
+
+assign data_count = wr_data_count[ADDR_WIDTH-1:0];
+assign free_count = DEPTH - wr_data_count[ADDR_WIDTH-1:0];
+
+endmodule
